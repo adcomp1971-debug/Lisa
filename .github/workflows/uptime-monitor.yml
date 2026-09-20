@@ -1,0 +1,59 @@
+name: Uptime monitor (external)
+
+# Внешний dead-man монитор: работает на инфраструктуре GitHub, не на нашем сервере.
+# Если VPS упадёт (сеть, питание, ядро, диск) — workflow это увидит и пришлёт алерт.
+# Локальные мониторы в такой ситуации бесполезны: они умирают вместе с сервером.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'    # каждые 15 минут
+  workflow_dispatch:           # можно запустить вручную
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить health сервера
+        id: health
+        run: |
+          set +e
+          CODE=$(curl -s -k -o /tmp/body -w '%{http_code}' --max-time 20 https://76.13.77.105/health)
+          BODY=$(head -c 100 /tmp/body 2>/dev/null | tr -d '\n')
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "body=$BODY" >> $GITHUB_OUTPUT
+          echo "HTTP $CODE | $BODY"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::СЕРВЕР НЕ ОТВЕЧАЕТ (HTTP $CODE)"
+            exit 1
+          fi
+
+      - name: Проверить VPN-порт (WireGuard 51820/udp недоступен извне, проверяем nginx+API)
+        if: always()
+        run: |
+          set +e
+          # проверяем, что отдаётся и второй публичный endpoint
+          CODE2=$(curl -s -k -o /dev/null -w '%{http_code}' --max-time 20 https://76.13.77.105/ 2>/dev/null)
+          echo "корень сайта: HTTP $CODE2"
+          # 200/301/302/403 — сервер жив и отвечает; 000 — лежит
+          if [ "$CODE2" = "000" ]; then
+            echo "::warning::Корень сайта не отвечает (сервер может быть недоступен)"
+          fi
+
+      - name: Алерт в Telegram (если задан секрет)
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN не задан в secrets — алерт не отправлен"
+            echo "::warning::Сервер недоступен, но Telegram-секрет не настроен"
+            exit 1
+          fi
+          MSG="🔴 SERVER DOWN%0A%0Ahttps://76.13.77.105/health не отвечает%0AПроверено: $(date -u '+%Y-%m-%d %H:%M UTC')%0AМонитор: GitHub Actions (внешний)"
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT}" -d "text=${MSG}" -d "parse_mode=HTML" || true
+
+      - name: Сообщить о восстановлении
+        if: success()
+        run: echo "✅ сервер отвечает, HTTP 200"
